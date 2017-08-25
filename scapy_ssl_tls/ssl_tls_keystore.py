@@ -12,6 +12,8 @@ import tinyec.ec as ec
 import tinyec.registry as ec_reg
 
 import scapy_ssl_tls.py3compat as py3compat
+from scapy_ssl_tls.py3compat import int_to_str, str_to_int
+
 
 def rsa_public_from_der_certificate(certificate):
     # Extract subject_public_key_info field from X.509 certificate (see RFC3280)
@@ -74,17 +76,6 @@ def nb_bits(int_):
     return int(math.ceil(math.log(int_) / math.log(2)))
 
 
-def int_to_str(int_):
-    hex_ = "%x" % int_
-    return binascii.unhexlify("%s%s" % ("" if len(hex_) % 2 == 0 else "0", hex_))
-
-
-def str_to_int(str_):
-    if str_ == "":
-        return 0
-    return int(binascii.hexlify(str_), 16)
-
-
 def ansi_str_to_point(str_):
     if not str_.startswith(b"\x04"):
         raise ValueError("ANSI octet string missing point prefix (0x04)")
@@ -96,7 +87,7 @@ def ansi_str_to_point(str_):
 
 
 def point_to_ansi_str(point):
-    return b"\x04%s%s" % (int_to_str(point.x), int_to_str(point.y))
+    return b"\x04" + int_to_str(point.x) + int_to_str(point.y)
 
 
 def tls_group_to_keystore(named_group_id, point_str):

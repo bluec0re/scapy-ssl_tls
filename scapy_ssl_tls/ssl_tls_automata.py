@@ -92,7 +92,7 @@ class TLSClientAutomata(Automaton):
     def parse_args(self,
                    target,
                    tls_version='TLS_1_1',
-                   request="GET / HTTP/1.1\r\nHOST: localhost\r\n\r\n",
+                   request=b"GET / HTTP/1.1\r\nHOST: localhost\r\n\r\n",
                    cipher_suites=[TLSCipherSuite.RSA_WITH_AES_128_CBC_SHA],
                    timeout=4.0,
                    **kwargs):

@@ -57,8 +57,5 @@ class PKCS7Encoder(object):
 
     def get_padding(self, text):
         l = len(text)
-        output = py3compat.StringIO()
         val = self.k - (l % self.k)
-        for _ in py3compat.xrange(val):
-            output.write('%02x' % val)
-        return py3compat.unhexlify(output.getvalue())
+        return py3compat.tobytes([val] * val)

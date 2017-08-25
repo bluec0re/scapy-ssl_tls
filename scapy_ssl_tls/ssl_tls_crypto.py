@@ -14,7 +14,7 @@ import math
 
 import scapy_ssl_tls.py3compat as py3compat
 import scapy_ssl_tls.pkcs7 as pkcs7
-import ssl_tls as tls  # fix import
+import scapy_ssl_tls.ssl_tls as tls  # fix import
 import scapy_ssl_tls.ssl_tls_keystore as tlsk
 import tinyec.ec as ec
 import tinyec.registry as ec_reg
@@ -258,7 +258,10 @@ TLS Session Context:
         self.negotiated.sig = self.cipher_properties["key_exchange"]["sig"]
         self.negotiated.mac = self.cipher_properties["hash"]["name"]
 
-        self.prf = TLSPRF(self.negotiated.version, self.cipher_properties.get("prf", {}).get("type"))
+        if self.negotiated.version == tls.TLSVersion.SSL_3_0:
+            self.prf = SSLPRF(self.negotiated.version)
+        else:
+            self.prf = TLSPRF(self.negotiated.version, self.cipher_properties.get("prf", {}).get("type"))
 
         if self.negotiated.resumption:
             self.sec_params = TLSSecurityParameters.from_master_secret(self.prf,
@@ -405,6 +408,18 @@ TLS Session Context:
                 private._randfunc = Random.new().read
                 # End workaround
                 self.premaster_secret = PKCS1_v1_5.new(private).decrypt(self.encrypted_premaster_secret, None)
+        elif client_kex.haslayer(tls.SSL3ClientRSAParams):
+            self.encrypted_premaster_secret = client_kex[tls.SSL3ClientRSAParams].data
+            # If we have the private key, let's decrypt the PMS
+            private = self.server_ctx.asym_keystore.private
+            if private is not None:
+                # I have no clue why pycrypto started failing after refactoring, missing this function
+                # Probably related to https://github.com/dlitz/pycrypto/issues/160
+                # TODO: workaround for now... Find root cause of pycrypto bug
+                from Cryptodome import Random
+                private._randfunc = Random.new().read
+                # End workaround
+                self.premaster_secret = PKCS1_v1_5.new(private).decrypt(self.encrypted_premaster_secret, None)
         elif client_kex.haslayer(tls.TLSClientDHParams):
             # Check if we have an unitialized keystore, and if so build a new one
             if isinstance(self.client_ctx.kex_keystore, tlsk.EmptyKexKeystore):
@@ -475,7 +490,7 @@ TLS Session Context:
                                                        iv=self.master_secrets.client.write_iv)
 
             ctx.finished_hashes.append(finished.data)
-            if finished.data != verify_data and finished.data != "":
+            if finished.data != verify_data and finished.data != b"":
                 warnings.warn("Finished hash does not match. Wanted %s, got %s" % (repr(verify_data), repr(finished.data)))
         self.__finish_count += 1
 
@@ -521,7 +536,7 @@ TLS Session Context:
             self.__handle_ccs(pkt[tls.TLSChangeCipherSpec], origin=origin)
 
     def _generate_random_pms(self, version):
-        return "%s%s" % (struct.pack("!H", version), os.urandom(46))
+        return struct.pack("!H", version) + os.urandom(46)
 
     def get_encrypted_pms(self, pms=None):
         cleartext = pms or self.premaster_secret
@@ -611,8 +626,9 @@ TLS Session Context:
                 for handshake in self._walk_handshake_msgs():
                     if handshake.haslayer(tls.TLSFinished):
                         # Special case of encrypted handshake. Remove crypto material to compute verify_data
-                        verify_data.append("%s%s%s" % (chr(handshake.type), struct.pack(">I", handshake.length)[1:],
-                                                       handshake[tls.TLSFinished].data))
+                        verify_data.append(py3compat.byte_chr(handshake.type) +
+                                           struct.pack(">I", handshake.length)[1:] +
+                                           handshake[tls.TLSFinished].data)
                     else:
                         verify_data.append(py3compat.bytes(handshake))
             else:
@@ -620,12 +636,11 @@ TLS Session Context:
 
             if self.negotiated.version == tls.TLSVersion.TLS_1_2:
                 prf_verify_data = self.prf.get_bytes(self.master_secret, label,
-                                                     self.prf.digest.new("".join(verify_data)).digest(),
+                                                     self.prf.digest.new(b"".join(verify_data)).digest(),
                                                      num_bytes=12)
             else:
                 prf_verify_data = self.prf.get_bytes(self.master_secret, label,
-                                                     "%s%s" % (MD5.new("".join(verify_data)).digest(),
-                                                               SHA.new("".join(verify_data)).digest()),
+                                                     MD5.new(b"".join(verify_data)).digest() + SHA.new(b"".join(verify_data)).digest(),
                                                      num_bytes=12)
         return prf_verify_data
 
@@ -687,14 +702,32 @@ TLS Session Context:
         self.negotiated.resumption = True
 
 
+class SSLPRF(object):
+    def __init__(self, tls_version):
+        if tls_version not in tls.TLS_VERSIONS.keys():
+            raise ValueError("Unknown TLS version: %d" % tls_version)
+        self.tls_version = tls_version
+        if self.tls_version > tls.TLSVersion.SSL_3_0 and digest is not None:
+            raise ValueError("PRF digest can be set only for SSL versions 3.0 and below")
+
+    def get_bytes(self, key, label, random, num_bytes):
+        bytes_ = b''
+        i = 1
+        while len(bytes_) < num_bytes:
+            prefix = py3compat.byte_chr(0x40 + i) * i
+            bytes_ += MD5.new(key + SHA.new(prefix + key + random).digest()).digest()
+            i += 1
+        return bytes_[:num_bytes]
+
+
 class TLSPRF(object):
-    TLS_MD_CLIENT_FINISH_CONST = "client finished"
-    TLS_MD_SERVER_FINISH_CONST = "server finished"
-    TLS_MD_KEY_EXPANSION_CONST = "key expansion"
-    TLS_MD_CLIENT_WRITE_KEY_CONST = "client write key"
-    TLS_MD_SERVER_WRITE_KEY_CONST = "server write key"
-    TLS_MD_IV_BLOCK_CONST = "IV block"
-    TLS_MD_MASTER_SECRET_CONST = "master secret"
+    TLS_MD_CLIENT_FINISH_CONST = b"client finished"
+    TLS_MD_SERVER_FINISH_CONST = b"server finished"
+    TLS_MD_KEY_EXPANSION_CONST = b"key expansion"
+    TLS_MD_CLIENT_WRITE_KEY_CONST = b"client write key"
+    TLS_MD_SERVER_WRITE_KEY_CONST = b"server write key"
+    TLS_MD_IV_BLOCK_CONST = b"IV block"
+    TLS_MD_MASTER_SECRET_CONST = b"master secret"
 
     def __init__(self, tls_version, digest=None):
         if tls_version not in tls.TLS_VERSIONS.keys():
@@ -721,17 +754,14 @@ class TLSPRF(object):
             # Get bytes from SHA1
             sha1_bytes = self._get_bytes(SHA, key_right, label, random, num_bytes)
 
-            xored = []
-            for i in range(num_bytes):
-                xored.append(chr(ord(md5_bytes[i]) ^ ord(sha1_bytes[i])))
-            bytes_ = b"".join(xored)
+            bytes_ = py3compat.xor_bytes(md5_bytes, sha1_bytes)
         return bytes_
 
     def _get_bytes(self, digest, key, label, random, num_bytes):
-        bytes_ = ""
-        block = HMAC.new(key=key, msg="%s%s" % (label, random), digestmod=digest).digest()
+        bytes_ = b""
+        block = HMAC.new(key=key, msg=label + random, digestmod=digest).digest()
         while len(bytes_) < num_bytes:
-            bytes_ += HMAC.new(key=key, msg="%s%s%s" % (block, label, random), digestmod=digest).digest()
+            bytes_ += HMAC.new(key=key, msg=block + label + random, digestmod=digest).digest()
             block = HMAC.new(key=key, msg=block, digestmod=digest).digest()
         return bytes_[:num_bytes]
 
@@ -763,11 +793,11 @@ class TLS13PRF(object):
             self.len_ = struct.pack("!H", len_)
             if (len(label) > 255) or (len(hash_) > 255):
                 raise ValueError("All values must be 255 bytes or less")
-            self.label = "%s%s" % (self.LABEL_PREFIX, label)
+            self.label = self.LABEL_PREFIX + label
             self.hash_ = hash_
 
         def __str__(self):
-            return "%s%s%s%s%s" % (self.len_, struct.pack("B", len(self.label)), self.label, struct.pack("B", len(self.hash_)), self.hash_)
+            return b"%s%s%s%s%s" % (self.len_, struct.pack("B", len(self.label)), self.label, struct.pack("B", len(self.hash_)), self.hash_)
 
     class TLSPRFEarlySecrets(object):
         def __init__(self, early_secret, binder_key=b"", client_early_traffic_secret=b"", early_exporter_secret=b""):
@@ -834,7 +864,7 @@ class TLS13PRF(object):
         return HKDF(self.digest).expand(len_, py3compat.bytes(TLS13PRF.HKDFLabel(len_, label, hash_)), key)
 
     def derive_early_secrets(self, psk=None, client_hello_hash=b"", resumption_psk=True):
-        psk = psk or "\x00" * self.digest_size
+        psk = psk or b"\x00" * self.digest_size
         binder_label = TLS13PRF.LABEL_RESUMPTION_PSK_BINDER_KEY if resumption_psk else TLS13PRF.LABEL_EXTERNAL_PSK_BINDER_KEY
         hkdf = HKDF(self.digest).extract(psk)
         if client_hello_hash == b"":
@@ -907,7 +937,7 @@ class HKDF(object):
         block = b""
         bytes_ = b""
         for i in range(1, n + 1):
-            block = HMAC.new(self.prk, "%s%s%s" % (block, info, struct.pack("B", i)), digestmod=self.digest).digest()
+            block = HMAC.new(self.prk, block + info + struct.pack("B", i), digestmod=self.digest).digest()
             bytes_ += block
         return bytes_[:len_]
 
@@ -1038,7 +1068,7 @@ class EAEADCryptoContext(CryptoContext):
 
     def get_nonce(self, nonce=None):
         nonce = nonce or struct.pack("!Q", self.ctx.nonce)
-        return b"%s%s" % (self.ctx.sym_keystore.iv, nonce)
+        return self.ctx.sym_keystore.iv + nonce
 
     def encrypt_data(self, data):
         crypto_container = EAEADCryptoContainer.from_data(self.tls_ctx, self.ctx, data)
@@ -1048,7 +1078,7 @@ class EAEADCryptoContext(CryptoContext):
         self.__init_ciphers(self.get_nonce())
         self.enc_cipher.update(crypto_container.aead)
         ciphertext, mac = self.enc_cipher.encrypt_and_digest(py3compat.bytes(crypto_container))
-        bytes_ = "%s%s%s" % (struct.pack("!Q", self.ctx.nonce), ciphertext, mac)
+        bytes_ = b"%s%s%s" % (struct.pack("!Q", self.ctx.nonce), ciphertext, mac)
         self.ctx.nonce += 1
         self.ctx.sequence += 1
         return bytes_
@@ -1057,7 +1087,7 @@ class EAEADCryptoContext(CryptoContext):
         explicit_nonce = ciphertext[:self.explicit_iv_size]
         ciphertext, tag = ciphertext[self.explicit_iv_size:-self.tag_size], ciphertext[-self.tag_size:]
         # Create an empty Crypto container to retrieve AEAD data based on length of cleartext
-        crypto_data = CryptoData.from_context(self.tls_ctx, self.ctx, "\x00" * len(ciphertext))
+        crypto_data = CryptoData.from_context(self.tls_ctx, self.ctx, b"\x00" * len(ciphertext))
         crypto_data.content_type = content_type
         crypto_container = EAEADCryptoContainer.from_context(self.tls_ctx, self.ctx, crypto_data)
         self.__init_ciphers(self.get_nonce(explicit_nonce))
@@ -1069,7 +1099,7 @@ class EAEADCryptoContext(CryptoContext):
             warnings.warn("Verification of GCM tag failed: %s" % why)
         self.ctx.nonce = struct.unpack("!Q", explicit_nonce)[0]
         self.ctx.sequence += 1
-        return "%s%s%s" % (explicit_nonce, cleartext, tag)
+        return explicit_nonce + cleartext + tag
 
 
 class IAEADCryptoContext(CryptoContext):
@@ -1099,7 +1129,7 @@ class IAEADCryptoContext(CryptoContext):
     def encrypt(self, crypto_container):
         self.__init_ciphers(self.get_nonce())
         ciphertext, mac = self.enc_cipher.encrypt_and_digest(py3compat.bytes(crypto_container))
-        bytes_ = "%s%s" % (ciphertext, mac)
+        bytes_ = ciphertext + mac
         self.ctx.sequence += 1
         return bytes_
 
@@ -1112,7 +1142,7 @@ class IAEADCryptoContext(CryptoContext):
         except ValueError as why:
             warnings.warn("Verification of GCM tag failed: %s" % why)
         self.ctx.sequence += 1
-        return "%s%s" % (cleartext, tag)
+        return cleartext + tag
 
 
 class CryptoContextFactory(object):
@@ -1168,11 +1198,11 @@ class StreamCryptoContainer(CryptoContainer):
         content_type_ = struct.pack("!B", self.crypto_data.content_type)
         version_ = struct.pack("!H", self.crypto_data.version)
         len_ = struct.pack("!H", self.crypto_data.data_len)
-        self.digest.update("%s%s%s%s%s" % (sequence_, content_type_, version_, len_, self.crypto_data.data))
+        self.digest.update(b"%s%s%s%s%s" % (sequence_, content_type_, version_, len_, self.crypto_data.data))
         self.mac = self.digest.digest()
 
     def __str__(self):
-        return "%s%s" % (self.crypto_data.data, self.mac)
+        return self.crypto_data.data + self.mac
 
 
 class CBCCryptoContainer(CryptoContainer):
@@ -1205,17 +1235,17 @@ class CBCCryptoContainer(CryptoContainer):
         content_type_ = struct.pack("!B", self.crypto_data.content_type)
         version_ = struct.pack("!H", self.crypto_data.version)
         len_ = struct.pack("!H", self.crypto_data.data_len)
-        self.digest.update("%s%s%s%s%s" % (sequence_, content_type_, version_, len_, self.crypto_data.data))
+        self.digest.update(b"%s%s%s%s%s" % (sequence_, content_type_, version_, len_, self.crypto_data.data))
         self.mac = self.digest.digest()
 
     def __pad(self):
         # "\xff" is a dummy trailing byte, to increase the length of imput
         # data by one byte. Any byte could do. This is to account for the
         # trailing padding_length byte in the RFC
-        self.padding = self.pkcs7.get_padding("%s%s\xff" % (self.crypto_data.data, self.mac))
+        self.padding = self.pkcs7.get_padding(b"%s%s\xff" % (self.crypto_data.data, self.mac))
 
     def __str__(self):
-        return "%s%s%s%s%s" % (self.explicit_iv, self.crypto_data.data, self.mac, self.padding, self.padding_len)
+        return b"%s%s%s%s%s" % (self.explicit_iv, self.crypto_data.data, self.mac, self.padding, self.padding_len)
 
 
 class EAEADCryptoContainer(CryptoContainer):
@@ -1238,7 +1268,7 @@ class EAEADCryptoContainer(CryptoContainer):
         content_type_ = struct.pack("!B", self.crypto_data.content_type)
         version_ = struct.pack("!H", self.crypto_data.version)
         len_ = struct.pack("!H", self.crypto_data.data_len)
-        self.aead = "%s%s%s%s" % (sequence_, content_type_, version_, len_)
+        self.aead = b"%s%s%s%s" % (sequence_, content_type_, version_, len_)
 
     def __str__(self):
         return self.crypto_data.data
@@ -1318,7 +1348,7 @@ class NullHash(object):
         pass
 
     def digest(self):
-        return ""
+        return b""
 
     def hexdigest(self):
         return ""

@@ -73,6 +73,8 @@ if PY2:
     def tobytes(s):
         if isinstance(s, unicode):
             return s.encode("latin-1")
+        elif isinstance(s, (list, tuple)):
+            return ''.join(map(chr, s))
         else:
             return ''.join(s)
 
@@ -99,6 +101,25 @@ if PY2:
 
     def next(c):
         return c.next()
+
+    def int_to_str(int_):
+        hex_ = "%x" % int_
+        return binascii.unhexlify(("" if len(hex_) % 2 == 0 else "0") + hex_)
+
+
+    def str_to_int(str_):
+        if str_ == "":
+            return 0
+        return int(binascii.hexlify(str_), 16)
+
+    def xor_bytes(*args):
+        xored = []
+        for chars in zip(*args):
+            val = 0
+            for c in chars:
+                val ^= ord(c)
+            xored.append(chr(val))
+        bytes_ = b"".join(xored)
 
     # It's possible to have sizeof(long) != sizeof(Py_ssize_t).
     class X(object):
@@ -175,11 +196,12 @@ else:
     def tobytes(s):
         if isinstance(s,bytes):
             return s
+        elif isinstance(s,str):
+            return s.encode("latin-1")
+        elif isinstance(s, (tuple, list)):
+            return bytes(s)
         else:
-            if isinstance(s,str):
-                return s.encode("latin-1")
-            else:
-                return bytes([s])
+            return bytes([s])
 
     import io
     StringIO = io.StringIO      # NOQA
@@ -207,3 +229,22 @@ else:
     next = next
 
     MAXSIZE = sys.maxsize       # NOQA
+
+    def int_to_str(int_):
+        hex_ = b"%x".format(int_)
+        return unhexlify((b"" if len(hex_) % 2 == 0 else b"0") + hex_)
+
+
+    def str_to_int(str_):
+        if not str_:
+            return 0
+        return int(hexlify(str_), 16)
+
+    def xor_bytes(*args):
+        xored = bytearray()
+        for chars in zip(*args):
+            val = 0
+            for c in chars:
+                val ^= c
+            xored.append(val)
+        return bytes(xored)
